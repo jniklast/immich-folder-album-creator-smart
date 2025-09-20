@@ -1,10 +1,3 @@
-[![Build Status](https://github.com/salvoxia/immich-folder-album-creator/workflows/CI/badge.svg)](https://github.com/Salvoxia/immich-folder-album-creator/actions/workflows/ci.yaml)
-[![Build Status](https://github.com/salvoxia/immich-folder-album-creator/workflows/build-image/badge.svg)](https://github.com/Salvoxia/immich-folder-album-creator/actions/workflows/build-image.yaml)
-[![Docker][docker-image]][docker-url]
-
-[docker-image]: https://img.shields.io/docker/pulls/salvoxia/immich-folder-album-creator.svg
-[docker-url]: https://hub.docker.com/r/salvoxia/immich-folder-album-creator/
-
 # Immich Folder Album Creator
 
 This is a python script designed to automatically create albums in [Immich](https://immich.app/) from a folder structure mounted into the Immich container.
@@ -14,7 +7,19 @@ Using the provided docker image, the script can simply be added to the Immich co
 __Current compatibility:__ Immich v1.106.1 - v1.142.x
 
 ### Disclaimer
-This script is mostly based on the following original script: [REDVM/immich_auto_album.py](https://gist.github.com/REDVM/d8b3830b2802db881f5b59033cf35702)
+This script is based on the original script from Salvoxia: [https://github.com/Salvoxia/immich-folder-album-creator)
+
+There are a few improvements to the basic operation by only syncing the differences to the remote album and not all assets everytime, which speeds up
+subsequent runs, after the initial assets have been added, significantly.
+
+Additionally it is extended with a "smart" tracking mode, that records all album updates in a file and can then do very quick updates and rescans of the library.
+The tracking mode has basically two different operation modes: "full-scan" and "update-scan". While full-scan always checks all assets and thus folders,
+the update-scan only checks assets added since the last scan was done. This results in a very quick import of new assets in to the albums at the cost of 
+inaccuracies due to deleted assets. Thus a regular full-scan should be performed to keep the albums accurate.
+
+THIS IS ONLY TESTED ON A PRIVATE INSTANCE WITH VERY LIMITED OPTIONS, THERE IS NO GUARANTEE, THAT ALL LEGACY OPTIONS STILL WORK AS EXPECTED. USE AT YOUR OWN RISK!
+
+Docker has not been tested either.
 
 ## Table of Contents
 - [Immich Folder Album Creator](#immich-folder-album-creator)

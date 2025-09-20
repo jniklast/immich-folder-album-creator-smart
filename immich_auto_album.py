@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Python script for creating albums in Immich from folder names in an external library."""
 
 # pylint: disable=too-many-lines
@@ -16,6 +17,8 @@ from urllib.error import HTTPError
 import regex
 import yaml
 
+import json
+
 import urllib3
 import requests
 
@@ -28,6 +31,8 @@ SCRIPT_MODE_CREATE = "CREATE"
 SCRIPT_MODE_CLEANUP = "CLEANUP"
 # Delete ALL albums
 SCRIPT_MODE_DELETE_ALL = "DELETE_ALL"
+# Just update with new assets
+SCRIPT_MODE_UPDATE = "UPDATE"
 
 # Environment variable to check if the script is running inside Docker
 ENV_IS_DOCKER = "IS_DOCKER"
@@ -101,6 +106,8 @@ class AlbumModel:
         self.inherit = None
         # List of property names that should be inherited
         self.inherit_properties = None
+        # Last createdAt date of album assets
+        self.newest_asset_date = 0
 
     def get_album_properties_dict(self) -> dict:
         """
@@ -127,13 +134,20 @@ class AlbumModel:
         """
         return str(self.get_album_properties_dict())
 
+    def add_asset(self, asset_to_add):
+        immich_timestamp = datetime.datetime.fromisoformat(asset_to_add['createdAt']).timestamp()
+        if immich_timestamp > self.newest_asset_date:
+            logging.debug(f"Asset {asset_to_add['originalPath']} is current newest asset in album {self.name}: {asset_to_add['createdAt']}")
+            self.newest_asset_date = immich_timestamp
+        self.assets.append(asset_to_add)
+
     def get_asset_uuids(self) -> list:
         """
         Gathers UUIDs of all assets and returns them
 
         Returns
         ---------
-            A list of asset UUIDs
+            A set of asset UUIDs
         """
         return [asset_to_add['id'] for asset_to_add in self.assets]
 
@@ -989,7 +1003,7 @@ def fetch_server_version() -> dict:
     return server_version
 
 
-def fetch_assets(is_not_in_album: bool, visibility_options: list[str]) -> list:
+def fetch_assets(is_not_in_album: bool, visibility_options: list[str], additional_search_options: dict = None) -> list:
     """
     Fetches assets from the Immich API.
 
@@ -1008,14 +1022,19 @@ def fetch_assets(is_not_in_album: bool, visibility_options: list[str]) -> list:
     ---------
         An array of asset objects
     """
+    search_options = additional_search_options if additional_search_options else {}
     if version['major'] == 1 and version ['minor'] < 133:
-        return fetch_assets_with_options({'isNotInAlbum': is_not_in_album, 'withArchived': 'archive' in visibility_options})
+        search_options.update({'isNotInAlbum': is_not_in_album, 'withArchived': 'archive' in visibility_options})
+        return fetch_assets_with_options(search_options)
 
-    asset_list = fetch_assets_with_options({'isNotInAlbum': is_not_in_album})
+    search_options.update({'isNotInAlbum': is_not_in_album})
+    asset_list = fetch_assets_with_options(search_options)
     for visiblity_option in visibility_options:
         # Do not fetch agin for 'timeline', that's the default!
         if visiblity_option != 'timeline':
-            asset_list += fetch_assets_with_options({'isNotInAlbum': is_not_in_album, 'visibility': visiblity_option})
+            visibility_search = search_options.copy()
+            visibility_search.update({'visibility': visiblity_option})
+            asset_list += fetch_assets_with_options(visibility_search)
     return asset_list
 
 def check_for_and_remove_live_photo_video_components(asset_list: list[dict], is_not_in_album: bool, find_archived: bool) -> list[dict]:
@@ -1054,8 +1073,19 @@ def check_for_and_remove_live_photo_video_components(asset_list: list[dict], is_
         if version['major'] == 1 and version ['minor'] < 133:
             full_asset_list = fetch_assets_with_options({'isNotInAlbum': False, 'withArchived': True})
         else:
-            full_asset_list = fetch_assets_with_options({'isNotInAlbum': False})
-            full_asset_list += fetch_assets_with_options({'isNotInAlbum': False, 'visibility': 'archive'})
+            if is_not_in_album:
+                logging.debug("Fetching all assets for not_in_album_list")
+                not_in_album_list = fetch_assets_with_options({'isNotInAlbum': False})
+            if not find_archived:
+                logging.debug("Fetching all assets archived")
+                archive_list = fetch_assets_with_options({'isNotInAlbum': False, 'visibility': 'archive'})
+
+            if is_not_in_album and not find_archived:
+                full_asset_list = not_in_album_list + archive_list
+            elif is_not_in_album:
+                full_asset_list = asset_list + not_in_album_list
+            else:
+                full_asset_list = asset_list + archive_list
     else:
         full_asset_list = asset_list
 
@@ -1300,6 +1330,56 @@ def add_assets_to_album(assets_add_album_id: str, asset_list: list[str]) -> list
                 asset_list_added.append(res['id'])
 
     return asset_list_added
+
+def remove_assets_from_album(assets_remove_album_id: str, asset_list: list[str]) -> list[str]:
+    """
+    Removes the assets IDs provided in assets to the provided albumId.
+
+    If assets if larger than number_of_images_per_request, the list is chunked
+    and one API call is performed per chunk.
+    Only logs errors and successes.
+
+    Returns
+
+    Parameters
+    ----------
+        assets_remove_album_id : str
+            The ID of the album to remove assets from
+        asset_list: list[str]
+            A list of asset IDs to remove from the album
+
+    Returns
+    ---------
+        The asset UUIDs that were actually added to the album (not respecting assets that were already part of the album)
+    """
+    api_endpoint = 'albums'
+
+    # Divide our assets into chunks of number_of_images_per_request,
+    # So the API can cope
+    assets_to_remove = []
+    for _ in assets:
+        for _asset in asset_list:
+            if _['id'] == _asset:
+                assets_to_remove.append(_)
+                break
+    logging.debug("Removed assets from album: %s", assets_to_remove)
+    assets_chunked = list(divide_chunks(asset_list, number_of_images_per_request))
+    asset_list_removed = []
+
+    for assets_chunk in assets_chunked:
+        data = {'ids':assets_chunk}
+        r = requests.delete(root_url+api_endpoint+f'/{assets_remove_album_id}/assets', json=data, **requests_kwargs, timeout=api_timeout)
+        check_api_response(r)
+        response = r.json()
+
+        for res in response:
+            if not res['success']:
+                if  res['error'] != 'duplicate':
+                    logging.warning("Error removing an asset from an album: %s", res['error'])
+            else:
+                asset_list_removed.append(res['id'])
+
+    return asset_list_removed
 
 def fetch_users():
     """Queries and returns all users"""
@@ -2047,7 +2127,7 @@ def build_album_list(asset_list : list[dict], root_path_list : list[str], album_
                         logged_albums.add(final_album_name)
 
             # Add asset to album model
-            new_album_model.assets.append(asset_to_add)
+            new_album_model.add_asset(asset_to_add)
             album_models[new_album_model.get_final_name()] = new_album_model
         else:
             logging.warning("Got empty album name for asset path %s, check your album_level settings!", asset_path)
@@ -2076,6 +2156,150 @@ def find_user_by_name_or_email(name_or_email: str, user_list: list[dict]) -> dic
         if name_or_email in (user['name'], user['email']):
             return user
     return None
+
+def is_album_outdated(album: AlbumModel, album_info: dict, start_timestamp: float, modification_list: dict, reprocess_interval_seconds: int):
+    """
+    Determines if the album has changed since the last tracking record of it. Returns true if no tracking.
+
+    Parameters
+    ----------
+        album: AlbumModel
+            The album to check
+        album_info: dict
+            Immich album info for the internal model
+        start_timestamp: float
+            Timestamp for this run of the script
+        modification_list: dict
+            Tracking information for all previously know albums
+        reprocess_interval_seconds: int
+            Interval to force reprocessing even if no change is detected
+    Returns
+    ---------
+        True if the album is outdated, False otherwise
+    """
+    # --last-modification-file isn't active -> process all albums
+    if modification_list is None:
+        return True
+    # album isn't known at all
+    if not album.id:
+        logging.info(f"{album.name} has no id yet and has to be processed")
+        return True
+    # album wasn't seen before
+    if not album.id in modification_list:
+        logging.info(f"{album.name} was not processed before")
+        return True
+    album_timestamp = modification_list[album.id]['last_modified']
+    # a new asset was added
+    if album.newest_asset_date > album_timestamp:
+        logging.info(f"{album.name} has a new asset")
+        return True
+    if len(album_info['assets']) != modification_list[album.id]['asset_count']:
+        logging.info(f"{album.name} has a different asset count")
+        return True
+    if len(album.assets) != modification_list[album.id]['asset_count']: 
+        logging.info(f"{album.name} has a new asset count")
+        return True
+    updated_timestamp = datetime.datetime.fromisoformat(album_info['updatedAt']).timestamp()
+    if updated_timestamp > album_timestamp:
+        logging.info(f"{album.name} has a more recent update timestamp")
+        return True
+    # timespan expired, rescan
+    if reprocess_interval_seconds and (start_timestamp - reprocess_interval_seconds) > album_timestamp:
+        logging.info(f"{album.name} has exceeded --reprocess-interval-seconds")
+        return True
+
+    # album is still up to date
+    logging.info(f"{album.name} is still up to date")
+    return False
+
+
+
+def get_or_create_album_modification_list(modification_file_path: str):
+    """
+    Creates or loads the tracking information file.
+
+    Parameters
+    ----------
+        modification_file_path: str
+            Path to the tracking file. If a dir is given, a default name will be used.
+
+    Returns
+    ---------
+        The final file path and the modification list (empty if not yet existing).
+        None,None if file creation or loading fails.
+    """
+    if os.path.isdir(modification_file_path):
+        if not os.access(modification_file_path, os.W_OK):
+            logging.fatal(f"{modification_file_path} is not writeable!")
+            return None,None
+        file_name = root_url.replace('://', '_').replace('/', '_').replace(':', '-')
+        file_name += "_album_record"
+        modification_file_path = os.path.join(modification_file_path, file_name)
+
+    if os.path.isfile(modification_file_path):
+        if not os.access(modification_file_path, os.W_OK):
+            logging.fatal(f"{modification_file_path} exists but is not writeable!")
+            return None,None
+        try:
+            with open(modification_file_path, 'r') as f:
+                return modification_file_path,json.load(f)
+        except (IOError, json.JSONDecodeError) as e:
+            logging.fatal(f"Error reading or decoding '{modification_file_path}': {e}")
+            return None,None
+    else:
+        parent_dir = os.path.dirname(modification_file_path) or os.getcwd()
+
+        # Check if the parent directory exists and is writable.
+        if os.path.isdir(parent_dir) and os.access(parent_dir, os.W_OK):
+            return modification_file_path,{}
+        else:
+            logging.fatal(f"{parent_dir} is not writeable for --last-modification-file!")
+            return None,None
+
+def new_album_record(album: AlbumModel, last_modified: float):
+    """
+    Creates a new tracing record for an album
+    Parameters
+    ----------
+        album: AlbumModel
+            Album model to be tracked
+        last_modified: float
+            Tiemstamp of last modification to be recorded
+
+    Returns
+    ---------
+        A new tracking record
+    """
+    return {
+                'name': album.name,
+                'last_modified': last_modified,
+                'asset_count': len(album.assets)
+    }
+
+def full_collection_record(assets: list[dict], last_modified: float, name: str = "Full Collection"):
+    """
+    Creates a new tracing record for the collection
+    Parameters
+    ----------
+        assets: list[dict]
+            List of assets to count
+        last_modified: float
+            Tiemstamp of last modification to be recorded
+        name: str
+            Name for the tracking record
+
+    Returns
+    ---------
+        A new tracking record for the collection
+    """
+    return {
+                'name': name,
+                'last_modified': last_modified,
+                'asset_count': len(assets)
+    }
+
+
+### main ###
 
 parser = argparse.ArgumentParser(description="Create Immich Albums from an external library path based on the top level folders",
     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -2169,6 +2393,13 @@ parser.add_argument("--update-album-props-mode", type=int, choices=[0, 1, 2], de
                             0 = Do not change album properties.
                             1 = Only override album properties but do not change the share status.
                             2 = Override album properties and share status, this will remove all users from the album which are not in the SHARE_WITH list.""")
+parser.add_argument("--tracking", nargs='?', const=".", help="Keep track of albums and use the smart update modes below. (Optional) Folder or file path for the tracking file.")
+parser.add_argument("--full-scan-interval", type=int, help="Timespan in hours to force a full scan of all albums to check.")
+parser.add_argument("--full-scan", action="store_true", help="Force a full scan.")
+parser.add_argument("--update-scan", action="store_true", help="Force an update scan.")
+parser.add_argument("--reprocess-interval", type=int, help="Timespan in days to force a full reprocession of an album, even if no new changes.")
+parser.add_argument("--remove-from-remote-album", action="store_true", help="Remove assets from remote album, if they are not included locally.")
+parser.add_argument("--only-delete-tracked", action="store_true", help="Only delete albums that were tracked before.")
 
 
 args = vars(parser.parse_args())
@@ -2212,6 +2443,34 @@ if comments_and_likes_disabled and comments_and_likes_enabled:
     logging.fatal("Arguments --comments-and-likes-enabled and --comments-and-likes-disabled cannot be used together! Choose one!")
     sys.exit(1)
 update_album_props_mode = args["update_album_props_mode"]
+tracking = args["tracking"]
+full_scan_interval = args["full_scan_interval"]
+full_scan = args["full_scan"]
+update_scan = args["update_scan"]
+reprocess_interval = args["reprocess_interval"]
+remove_from_remote_album = args["remove_from_remote_album"]
+only_delete_tracked = args["only_delete_tracked"]
+
+if not tracking:
+    if full_scan_interval:
+        logging.fatal("Argument --full-scan-interval needs --tracking to be set!")
+        sys.exit(1)
+    if full_scan:
+        logging.fatal("Argument --full-scan needs --tracking to be set!")
+        sys.exit(1)
+    if update_scan:
+        logging.fatal("Argument --update-scan needs --tracking to be set!")
+        sys.exit(1)
+    if reprocess_interval:
+        logging.fatal("Argument --reprocess-interval needs --tracking to be set!")
+        sys.exit(1)
+    if only_delete_known:
+        logging.fatal("Argument --only-delete-known needs --tracking to be set!")
+        sys.exit(1)
+
+if full_scan and update_scan:
+    logging.fatal("Arguments --full-scan and --update-scan are mutually exclusive, choose one!")
+    sys.exit(1)
 
 if mode != SCRIPT_MODE_CREATE:
     # Override unattended if we're running in destructive mode
@@ -2259,6 +2518,14 @@ logging.debug("api_timeout = %s", api_timeout)
 logging.debug("comments_and_likes_enabled = %s", comments_and_likes_enabled)
 logging.debug("comments_and_likes_disabled = %s", comments_and_likes_disabled)
 logging.debug("update_album_props_mode = %d", update_album_props_mode)
+logging.debug("tracking = %s", tracking)
+logging.debug(f"reprocess_interval = {reprocess_interval}")
+logging.debug(f"full_scan_interval = {full_scan_interval}")
+logging.debug("full_scan = %s", full_scan)
+logging.debug("update_scan = %s", update_scan)
+logging.debug("remove_from_remote_album = %s", remove_from_remote_album)
+logging.debug("only_delete_tracked = %s", only_delete_tracked)
+
 
 # Verify album levels
 if is_integer(album_levels) and album_levels == 0:
@@ -2292,7 +2559,7 @@ if not is_integer(album_levels):
             (int(album_levels_range_split[0]) < 0 and int(album_levels_range_split[1]) < 0 and int(album_levels_range_split[0]) > int(album_levels_range_split[1]))
         ]):
         logging.error(("Invalid album_levels range format! If a range should be set, the start level and end level must be separated by a comma like '<startLevel>,<endLevel>'. "
-                      "If negative levels are used in a range, <startLevel> must be less than or equal to <endLevel>."))
+                    "If negative levels are used in a range, <startLevel> must be less than or equal to <endLevel>."))
         sys.exit(1)
     album_levels_range_arr = album_levels_range_split
     # Convert to int
@@ -2333,11 +2600,39 @@ for i in range(len(root_paths)):
 if root_url[-1] != '/':
     root_url = root_url + '/'
 
+album_modification_list = None
+incremental_update_file = None
+if tracking:
+    incremental_update_file,album_modification_list = get_or_create_album_modification_list(tracking)
+    if album_modification_list is None:
+        sys.exit(1)
+    else:
+        tracked_albums = len(album_modification_list) - 2 if album_modification_list else 0
+        logging.debug(f"Tracking in file {incremental_update_file}, previously tracked albums: {tracked_albums}")
+
+full_scan_interval_seconds = None
+if full_scan_interval:
+    if is_integer(full_scan_interval):
+        full_scan_interval_seconds = full_scan_interval * 3600
+    else:
+        logging.fatal(f"{full_scan_interval} is not a valid number of hours!")
+        sys.exit(1)
+
+reprocess_interval_seconds = None
+if reprocess_interval_seconds:
+    if is_integer(reprocess_interval_seconds):
+        full_scan_interval_seconds = reprocess_interval_seconds * 86400
+    else:
+        logging.fatal(f"{reprocess_interval_seconds} is not a valid number of days!")
+        sys.exit(1)
+
 version = fetch_server_version()
 # Check version
 if version['major'] == 1 and version ['minor'] < 106:
     logging.fatal("This script only works with Immich Server v1.106.0 and newer! Update Immich Server or use script version 0.8.1!")
     sys.exit(1)
+
+
 
 # Special case: Run Mode DELETE_ALL albums
 if mode == SCRIPT_MODE_DELETE_ALL:
@@ -2354,11 +2649,36 @@ if read_album_properties:
     for album_properties_path, album_properties_template in album_properties_templates.items():
         logging.debug("Albumprops: %s -> %s", album_properties_path, album_properties_template)
 
-logging.info("Requesting all assets")
+start_timestamp = datetime.datetime.now().timestamp()
+
+if update_scan:
+    mode = SCRIPT_MODE_UPDATE
+
+if mode == SCRIPT_MODE_UPDATE:
+    if not album_modification_list:
+        logging.warning("Cannot perform an update scan without any prior scan")
+        mode = SCRIPT_MODE_CREATE
+    else:
+        # no reprocess on update
+        reprocess_interval_seconds = None
+        remove_from_remote_album = False
+elif full_scan_interval_seconds and not full_scan and album_modification_list:
+    last_check = album_modification_list["full_scan"]
+    if (start_timestamp - last_check['last_modified']) < full_scan_interval_seconds:
+        mode = SCRIPT_MODE_UPDATE
+
+
+logging.info("Requesting assets")
+
 # only request images that are not in any album if we are running in CREATE mode,
 # otherwise we need all images, even if they are part of an album
 if mode == SCRIPT_MODE_CREATE:
     assets = fetch_assets(not find_assets_in_albums, ['archive'] if find_archived_assets else [])
+elif mode == SCRIPT_MODE_UPDATE:
+    last_update_ts = album_modification_list["update_scan"]['last_modified']
+    last_update = datetime.datetime.fromtimestamp(last_update_ts).strftime('%Y-%m-%d %H:%M:%S')
+    logging.info(f"SCRIPT_MODE_UPDATE: Only searching for assets created after: {last_update}")
+    assets = fetch_assets(not find_assets_in_albums, ['archive'] if find_archived_assets else [], {'createdAfter': last_update})
 else:
     assets = fetch_assets(False, ['archive'])
 
@@ -2372,9 +2692,11 @@ albums_to_create = dict(sorted(albums_to_create.items(), key=lambda item: item[0
 
 if version['major'] == 1 and version ['minor'] < 133:
     albums_with_visibility = [album_check_to_check for album_check_to_check in albums_to_create.values()
-                              if album_check_to_check.visibility is not None and album_check_to_check.visibility != 'archive']
+                            if album_check_to_check.visibility is not None and album_check_to_check.visibility != 'archive']
     if len(albums_with_visibility) > 0:
         logging.warning("Option 'visibility' is only supported in Immich Server v1.133.x and newer! Option will be ignored!")
+
+
 
 logging.info("%d albums identified", len(albums_to_create))
 logging.info("Album list: %s", list(albums_to_create.keys()))
@@ -2414,7 +2736,7 @@ users = fetch_users()
 logging.debug("Found users: %s", users)
 
 # mode CREATE
-logging.info("Create / Append to Albums")
+logging.info("Create / Update Albums")
 created_albums = []
 # List for gathering all asset UUIDs for later archiving
 asset_uuids_added = []
@@ -2422,39 +2744,67 @@ for album in albums_to_create.values():
     # Special case: Add assets to Locked folder
     # Locked assets cannot be part of an album, so don't create albums in the first place
     if album.visibility == 'locked':
-        set_assets_visibility(album.get_asset_uuids(), album.visibility)
-        logging.info("Added %d assets to locked folder", len(album.get_asset_uuids()))
-        continue
+            set_assets_visibility(album.get_asset_uuids(), album.visibility)
+            logging.info("Added %d assets to locked folder", len(album.get_asset_uuids()))
+            continue
 
+    assets_to_add = set()
+    assets_to_remove = set()
     # Create album if inexistent:
     if not album.id:
+        logging.info(f"Album {album.name} does not exist yet and will be created")
         album.id = create_album(album.get_final_name())
         created_albums.append(album)
         logging.info('Album %s added!', album.get_final_name())
 
-    logging.info("Adding assets to album %s", album.get_final_name())
-    assets_added = add_assets_to_album(album.id, album.get_asset_uuids())
-    if len(assets_added) > 0:
-        asset_uuids_added += assets_added
-        logging.info("%d new assets added to %s", len(assets_added), album.get_final_name())
+        assets_to_add.update(album.get_asset_uuids())
 
-    # Set assets visibility
-    if album.visibility is not None:
-        set_assets_visibility(assets_added, album.visibility)
-        logging.info("Set visibility for %d assets to %s", len(assets_added), album.visibility)
+    else:
+        album_info = fetch_album_info(album.id)
+        if (mode == SCRIPT_MODE_UPDATE) or is_album_outdated(album, album_info, start_timestamp, album_modification_list, reprocess_interval_seconds):
+            remote_assets = set([asset_to_add['id'] for asset_to_add in album_info['assets']])
+            local_assets = set(album.get_asset_uuids())
 
-    # Update album properties depending on mode or if newly created
-    if update_album_props_mode > 0 or (album in created_albums):
-        # Update album properties
-        try:
-            update_album_properties(album)
-        except HTTPError as e:
-            logging.error('Error updating properties for album %s: %s', album.get_final_name(), e)
+            assets_to_add = local_assets.difference(remote_assets)
 
-    # Update album sharing if needed or newly created
-    if update_album_props_mode == 2 or (album in created_albums):
-        # Handle album sharing
-        update_album_shared_state(album, True)
+            if remove_from_remote_album:
+                assets_to_remove = remote_assets.difference(local_assets)
+
+    if assets_to_add:
+        logging.info("Adding assets to album %s", album.get_final_name())
+        assets_added = add_assets_to_album(album.id, list(assets_to_add))
+        if len(assets_added) > 0:
+            logging.info("%d new assets added to %s", len(assets_added), album.get_final_name())
+
+        # Set assets visibility
+        if album.visibility is not None:
+            set_assets_visibility(assets_added, album.visibility)
+            logging.info("Set visibility for %d assets to %s", len(assets_added), album.visibility)
+
+    if assets_to_remove:
+        logging.info("Removing assets from album %s", album.get_final_name())
+        assets_removed = remove_assets_from_album(album.id, list(assets_to_remove))
+        if len(assets_removed) > 0:
+            logging.info("%d assets removed from %s", len(assets_removed), album.get_final_name())
+
+    if assets_to_add or assets_to_remove:
+        # Update album properties depending on mode or if newly created
+        if update_album_props_mode > 0 or (album in created_albums):
+            # Update album properties
+            try:
+                update_album_properties(album)
+            except HTTPError as e:
+                logging.error('Error updating properties for album %s: %s', album.get_final_name(), e)
+
+        # Update album sharing if needed or newly created
+        if update_album_props_mode == 2 or (album in created_albums):
+            # Handle album sharing
+            update_album_shared_state(album, True)
+
+        if (mode != SCRIPT_MODE_UPDATE) and album_modification_list is not None:
+            album_info = fetch_album_info(album.id)
+            album_timestamp = max(datetime.datetime.fromisoformat(album_info['updatedAt']).timestamp(), start_timestamp)
+            album_modification_list[album.id] = new_album_record(album, album_timestamp)
 
 logging.info("%d albums created", len(created_albums))
 
@@ -2484,7 +2834,7 @@ if sync_mode == 2:
 # Attention: Since Offline Asset Removal is an asynchronous job,
 # albums affected by it are most likely not empty yet! So this
 # might only be effective in the next script run.
-if sync_mode >= 1:
+if sync_mode >= 1 and not mode == SCRIPT_MODE_UPDATE:
     logging.info("Deleting all empty albums")
     albums = fetch_albums()
     # pylint: disable=C0103
@@ -2493,6 +2843,10 @@ if sync_mode >= 1:
     cleaned_album_count = 0
     for album in albums:
         if album['assetCount'] == 0:
+            if only_delete_tracked:
+                if not album['id'] in album_modification_list:
+                    logging.info("Empty album %s was not tracked and will not be deleted", album['albumName'])
+                    continue
             empty_album_count += 1
             logging.info("Deleting empty album %s", album['albumName'])
             if delete_album(album):
@@ -2502,4 +2856,19 @@ if sync_mode >= 1:
     else:
         logging.info("No empty albums found!")
 
+if album_modification_list is not None:
+    if mode == SCRIPT_MODE_CREATE:
+        album_modification_list["full_scan"] = full_collection_record(assets, start_timestamp)
+        album_modification_list["update_scan"] = full_collection_record(assets, start_timestamp, "New Files")
+    elif mode == SCRIPT_MODE_UPDATE:
+        album_modification_list["update_scan"] = full_collection_record(assets, start_timestamp, "New Files")
+    logging.info(f"Writing last album state data to {incremental_update_file}")
+    try:
+        with open(incremental_update_file, 'w') as f:
+            json.dump(album_modification_list, f, indent=4)
+    except IOError as e:
+        logging.fatal(f"Error writing to '{incremental_update_file}': {e}")
+        sys.exit(1)
+
 logging.info("Done!")
+

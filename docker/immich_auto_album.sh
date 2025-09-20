@@ -184,6 +184,36 @@ elif [ "$COMMENTS_AND_LIKES" == "0" ]; then
     args="--comments-and-likes-disabled $args"
 fi
 
+if [ "$TRACKING" = "true" ]; then
+    args="--tracking $args"
+elif [ ! -z "$TRACKING" ]; then
+    args="--tracking=\"$TRACKING\" $args"
+fi
+
+if [ ! -z "$FULL_SCAN_INTERVAL" ]; then
+    args="--full-scan-interval=\"$FULL_SCAN_INTERVAL\" $args"
+fi
+
+if [ ! -z "$REPROCESS_INTERVAL" ]; then
+    args="--reprocess-interval=\"$REPROCESS_INTERVAL\" $args"
+fi
+
+if [ "$FULL_SCAN" = "true" ]; then
+    args="--full-scan $args"
+fi
+
+if [ "$UPDATE_SCAN" = "true" ]; then
+    args="--update-scan $args"
+fi
+
+if [ "$REMOVE_FROM_REMOTE_ALBUM" = "true" ]; then
+    args="--remove-from-remote-album $args"
+fi
+
+if [ "$ONLY_DELETE_TRACKED" = "true" ]; then
+    args="--only-delete-tracked $args"
+fi
+
 if [ ! -z "$UPDATE_ALBUM_PROPS_MODE" ]; then
     args="--update-album-props-mode $UPDATE_ALBUM_PROPS_MODE $args"
 fi
