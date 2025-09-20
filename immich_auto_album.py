@@ -2204,8 +2204,8 @@ def is_album_outdated(album: AlbumModel, album_info: dict, start_timestamp: floa
         logging.info(f"{album.name} has a more recent update timestamp")
         return True
     # timespan expired, rescan
-    if reprocess_interval_seconds and (start_timestamp - reprocess_interval_seconds) > album_timestamp:
-        logging.info(f"{album.name} has exceeded --reprocess-interval-seconds")
+    if reprocess_interval_seconds and (start_timestamp - album_timestamp) > reprocess_interval_seconds:
+        logging.info(f"{album.name} has exceeded --reprocess-interval")
         return True
 
     # album is still up to date
@@ -2619,11 +2619,11 @@ if full_scan_interval:
         sys.exit(1)
 
 reprocess_interval_seconds = None
-if reprocess_interval_seconds:
-    if is_integer(reprocess_interval_seconds):
-        full_scan_interval_seconds = reprocess_interval_seconds * 86400
+if reprocess_interval:
+    if is_integer(reprocess_interval):
+        reprocess_interval_seconds = reprocess_interval * 86400
     else:
-        logging.fatal(f"{reprocess_interval_seconds} is not a valid number of days!")
+        logging.fatal(f"{reprocess_interval} is not a valid number of days!")
         sys.exit(1)
 
 version = fetch_server_version()
@@ -2750,6 +2750,7 @@ for album in albums_to_create.values():
 
     assets_to_add = set()
     assets_to_remove = set()
+    album_updated = False
     # Create album if inexistent:
     if not album.id:
         logging.info(f"Album {album.name} does not exist yet and will be created")
@@ -2759,6 +2760,8 @@ for album in albums_to_create.values():
 
         assets_to_add.update(album.get_asset_uuids())
 
+        album_updated = True
+
     else:
         album_info = fetch_album_info(album.id)
         if (mode == SCRIPT_MODE_UPDATE) or is_album_outdated(album, album_info, start_timestamp, album_modification_list, reprocess_interval_seconds):
@@ -2766,6 +2769,8 @@ for album in albums_to_create.values():
             local_assets = set(album.get_asset_uuids())
 
             assets_to_add = local_assets.difference(remote_assets)
+
+            album_updated = True
 
             if remove_from_remote_album:
                 assets_to_remove = remote_assets.difference(local_assets)
@@ -2787,7 +2792,7 @@ for album in albums_to_create.values():
         if len(assets_removed) > 0:
             logging.info("%d assets removed from %s", len(assets_removed), album.get_final_name())
 
-    if assets_to_add or assets_to_remove:
+    if album_updated and (mode != SCRIPT_MODE_UPDATE):
         # Update album properties depending on mode or if newly created
         if update_album_props_mode > 0 or (album in created_albums):
             # Update album properties
@@ -2801,7 +2806,8 @@ for album in albums_to_create.values():
             # Handle album sharing
             update_album_shared_state(album, True)
 
-        if (mode != SCRIPT_MODE_UPDATE) and album_modification_list is not None:
+        if album_modification_list is not None:
+            # update recorded album information
             album_info = fetch_album_info(album.id)
             album_timestamp = max(datetime.datetime.fromisoformat(album_info['updatedAt']).timestamp(), start_timestamp)
             album_modification_list[album.id] = new_album_record(album, album_timestamp)
@@ -2851,12 +2857,15 @@ if sync_mode >= 1 and not mode == SCRIPT_MODE_UPDATE:
             logging.info("Deleting empty album %s", album['albumName'])
             if delete_album(album):
                 cleaned_album_count += 1
+                if album_modification_list and album['id'] in album_modification_list:
+                    del album_modification_list[album['id']]
     if empty_album_count > 0:
         logging.info("Successfully deleted %d/%d empty albums!", cleaned_album_count, empty_album_count)
     else:
         logging.info("No empty albums found!")
 
 if album_modification_list is not None:
+    # Add last scan information as special "albums"
     if mode == SCRIPT_MODE_CREATE:
         album_modification_list["full_scan"] = full_collection_record(assets, start_timestamp)
         album_modification_list["update_scan"] = full_collection_record(assets, start_timestamp, "New Files")
